@@ -3,6 +3,8 @@
 cd PathRAG
 pip install -e .
 ```
+Quick Start
+----------------------
 ```python
 import os
 from PathRAG import PathRAG, QueryParam
@@ -29,6 +31,17 @@ with open(data_file) as f:
     rag.insert(f.read())
 
 print(rag.query(question, param=QueryParam(mode="hybrid")))
+import os
+folder_path = "your_folder_path"  
+
+txt_files = [f for f in os.listdir(folder_path) if f.endswith(".txt")]
+for file_name in txt_files:
+    file_path = os.path.join(folder_path, file_name)
+    with open(file_path, "r", encoding="utf-8") as file:
+        rag.insert(file.read())
+```
+batch_insert
+```python
 import os
 folder_path = "your_folder_path"  
 
@@ -382,7 +395,81 @@ class PathRAG:
         finally:
             if update_storage:
                 await self._insert_done()
+#-----------------------------------------
+def chunking_by_token_size(
+    content: str, overlap_token_size=128, max_token_size=1024, tiktoken_model="gpt-4o"
+):
+    tokens = encode_string_by_tiktoken(content, model_name=tiktoken_model)
+    results = []
+    for index, start in enumerate(
+        range(0, len(tokens), max_token_size - overlap_token_size)
+    ):
+        chunk_content = decode_tokens_by_tiktoken(
+            tokens[start : start + max_token_size], model_name=tiktoken_model
+        )
+        results.append(
+            {
+                "tokens": min(max_token_size, len(tokens) - start),
+                "content": chunk_content.strip(),
+                "chunk_order_index": index,
+            }
+        )
+    return results
+async def extract_entities(
+    chunks: dict[str, TextChunkSchema],
+    knowledge_graph_inst: BaseGraphStorage,
+    entity_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    global_config: dict,
+) -> Union[BaseGraphStorage, None]:
+    time.sleep(20)
+    use_llm_func: callable = global_config["llm_model_func"]
+    entity_extract_max_gleaning = global_config["entity_extract_max_gleaning"]
 
+    ordered_chunks = list(chunks.items())
+  
+    language = global_config["addon_params"].get(
+        "language", PROMPTS["DEFAULT_LANGUAGE"]
+    )
+    entity_types = global_config["addon_params"].get(
+        "entity_types", PROMPTS["DEFAULT_ENTITY_TYPES"]
+    )
+    example_number = global_config["addon_params"].get("example_number", None)
+    if example_number and example_number < len(PROMPTS["entity_extraction_examples"]):
+        examples = "\n".join(
+            PROMPTS["entity_extraction_examples"][: int(example_number)]
+        )
+    else:
+        examples = "\n".join(PROMPTS["entity_extraction_examples"])
+
+    example_context_base = dict(
+        tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
+        record_delimiter=PROMPTS["DEFAULT_RECORD_DELIMITER"],
+        completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
+        entity_types=",".join(entity_types),
+        language=language,
+    )
+  
+    examples = examples.format(**example_context_base)
+
+    entity_extract_prompt = PROMPTS["entity_extraction"]
+    context_base = dict(
+        tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
+        record_delimiter=PROMPTS["DEFAULT_RECORD_DELIMITER"],
+        completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
+        entity_types=",".join(entity_types),
+        examples=examples,
+        language=language,
+    )
+
+    continue_prompt = PROMPTS["entiti_continue_extraction"]
+    if_loop_prompt = PROMPTS["entiti_if_loop_extraction"]
+
+    already_processed = 0
+    already_entities = 0
+    already_relations = 0
+
+#-----------------------------------------
     async def _insert_done(self):
         tasks = []
         for storage_inst in [
@@ -561,7 +648,133 @@ class PathRAG:
             raise ValueError(f"Unknown mode {param.mode}")
         await self._query_done()
         return response
+#-----------------------------------
+async def kg_query(
+    query,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage[TextChunkSchema],
+    query_param: QueryParam,
+    global_config: dict,
+    hashing_kv: BaseKVStorage = None,
+) -> str:
 
+    use_model_func = global_config["llm_model_func"]
+    args_hash = compute_args_hash(query_param.mode, query)
+    cached_response, quantized, min_val, max_val = await handle_cache(
+        hashing_kv, args_hash, query, query_param.mode
+    )
+    if cached_response is not None:
+        return cached_response
+
+    example_number = global_config["addon_params"].get("example_number", None)
+    if example_number and example_number < len(PROMPTS["keywords_extraction_examples"]):
+        examples = "\n".join(
+            PROMPTS["keywords_extraction_examples"][: int(example_number)]
+        )
+    else:
+        examples = "\n".join(PROMPTS["keywords_extraction_examples"])
+    language = global_config["addon_params"].get(
+        "language", PROMPTS["DEFAULT_LANGUAGE"]
+    )
+
+    if query_param.mode not in ["hybrid"]:
+        logger.error(f"Unknown mode {query_param.mode} in kg_query")
+        return PROMPTS["fail_response"]
+
+
+    kw_prompt_temp = PROMPTS["keywords_extraction"]
+    kw_prompt = kw_prompt_temp.format(query=query, examples=examples, language=language)
+    result = await use_model_func(kw_prompt, keyword_extraction=True)
+    logger.info("kw_prompt result:")
+    print(result)
+    try:
+
+        match = re.search(r"\{.*\}", result, re.DOTALL)
+        if match:
+            result = match.group(0)
+            keywords_data = json.loads(result)
+
+            hl_keywords = keywords_data.get("high_level_keywords", [])
+            ll_keywords = keywords_data.get("low_level_keywords", [])
+        else:
+            logger.error("No JSON-like structure found in the result.")
+            return PROMPTS["fail_response"]
+
+
+    except json.JSONDecodeError as e:
+        print(f"JSON parsing error: {e} {result}")
+        return PROMPTS["fail_response"]
+
+
+    if hl_keywords == [] and ll_keywords == []:
+        logger.warning("low_level_keywords and high_level_keywords is empty")
+        return PROMPTS["fail_response"]
+    if ll_keywords == [] and query_param.mode in ["hybrid"]:
+        logger.warning("low_level_keywords is empty")
+        return PROMPTS["fail_response"]
+    else:
+        ll_keywords = ", ".join(ll_keywords)
+    if hl_keywords == [] and query_param.mode in ["hybrid"]:
+        logger.warning("high_level_keywords is empty")
+        return PROMPTS["fail_response"]
+    else:
+        hl_keywords = ", ".join(hl_keywords)
+
+
+    keywords = [ll_keywords, hl_keywords]
+    context= await _build_query_context(
+        keywords,
+        knowledge_graph_inst,
+        entities_vdb,
+        relationships_vdb,
+        text_chunks_db,
+        query_param,
+    )
+
+    
+
+    if query_param.only_need_context:
+        return context
+    if context is None:
+        return PROMPTS["fail_response"]
+    sys_prompt_temp = PROMPTS["rag_response"]
+    sys_prompt = sys_prompt_temp.format(
+        context_data=context, response_type=query_param.response_type
+    )
+    if query_param.only_need_prompt:
+        return sys_prompt
+    response = await use_model_func(
+        query,
+        system_prompt=sys_prompt,
+        stream=query_param.stream,
+    )
+    if isinstance(response, str) and len(response) > len(sys_prompt):
+        response = (
+            response.replace(sys_prompt, "")
+            .replace("user", "")
+            .replace("model", "")
+            .replace(query, "")
+            .replace("<system>", "")
+            .replace("</system>", "")
+            .strip()
+        )
+
+
+    await save_to_cache(
+        hashing_kv,
+        CacheData(
+            args_hash=args_hash,
+            content=response,
+            prompt=query,
+            quantized=quantized,
+            min_val=min_val,
+            max_val=max_val,
+            mode=query_param.mode,
+        ),)
+    return response
+#----------------------------
         
     async def _query_done(self):
         tasks = []
