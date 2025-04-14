@@ -1373,7 +1373,172 @@ Output:
         query_param,
     )
 
+#-------------
+async def _build_query_context(
+    query: list,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage[TextChunkSchema],
+    query_param: QueryParam,
+):
+    ll_entities_context, ll_relations_context, ll_text_units_context = "", "", ""
+    hl_entities_context, hl_relations_context, hl_text_units_context = "", "", ""
+
+    ll_kewwords, hl_keywrds = query[0], query[1]
+    if query_param.mode in ["local", "hybrid"]:
+        if ll_kewwords == "":
+            ll_entities_context, ll_relations_context, ll_text_units_context = (
+                "",
+                "",
+                "",
+            )
+            warnings.warn(
+                "Low Level context is None. Return empty Low entity/relationship/source"
+            )
+            query_param.mode = "global"
+        else:
+            (
+                ll_entities_context,
+                ll_relations_context,
+                ll_text_units_context,
+            ) = await _get_node_data(
+                ll_kewwords,
+                knowledge_graph_inst,
+                entities_vdb,
+                text_chunks_db,
+                query_param,
+            )
+    if query_param.mode in ["hybrid"]:
+        if hl_keywrds == "":
+            hl_entities_context, hl_relations_context, hl_text_units_context = (
+                "",
+                "",
+                "",
+            )
+            warnings.warn(
+                "High Level context is None. Return empty High entity/relationship/source"
+            )
+            query_param.mode = "local"
+        else:
+            (
+                hl_entities_context,
+                hl_relations_context,
+                hl_text_units_context,
+            ) = await _get_edge_data(
+                hl_keywrds,
+                knowledge_graph_inst,
+                relationships_vdb,
+                text_chunks_db,
+                query_param,
+            )
+            if (
+                hl_entities_context == ""
+                and hl_relations_context == ""
+                and hl_text_units_context == ""
+            ):
+                logger.warn("No high level context found. Switching to local mode.")
+                query_param.mode = "local"
+    if query_param.mode == "hybrid":
+        entities_context, relations_context, text_units_context = combine_contexts(
+            [hl_entities_context, hl_relations_context],
+            [ll_entities_context, ll_relations_context],
+            [hl_text_units_context, ll_text_units_context],
+        )
+
+
+    return f"""
+-----global-information-----
+-----high-level entity information-----
+```csv
+{hl_entities_context}
+```
+-----high-level relationship information-----
+```csv
+{hl_relations_context}
+```
+-----Sources-----
+```csv
+{text_units_context}
+```
+-----local-information-----
+-----low-level entity information-----
+```csv
+{ll_entities_context}
+```
+-----low-level relationship information-----
+```csv
+{ll_relations_context}
+```
+"""
+
+async def _get_node_data(
+    query,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage[TextChunkSchema],
+    query_param: QueryParam,
+):
+
+    results = await entities_vdb.query(query, top_k=query_param.top_k)
+    if not len(results):
+        return "", "", ""
+
+    node_datas = await asyncio.gather(
+        *[knowledge_graph_inst.get_node(r["entity_name"]) for r in results]
+    )
+    if not all([n is not None for n in node_datas]):
+        logger.warning("Some nodes are missing, maybe the storage is damaged")
+
+
+    node_degrees = await asyncio.gather(
+        *[knowledge_graph_inst.node_degree(r["entity_name"]) for r in results]
+    )
+    node_datas = [
+        {**n, "entity_name": k["entity_name"], "rank": d}
+        for k, n, d in zip(results, node_datas, node_degrees)
+        if n is not None
+    ]  
+    use_text_units = await _find_most_related_text_unit_from_entities(
+        node_datas, query_param, text_chunks_db, knowledge_graph_inst
+    )
+
+
+    use_relations= await _find_most_related_edges_from_entities3(
+        node_datas, query_param, knowledge_graph_inst
+    )
+
+    logger.info(
+        f"Local query uses {len(node_datas)} entites, {len(use_relations)} relations, {len(use_text_units)} text units"
+    )
+
+
+    entites_section_list = [["id", "entity", "type", "description", "rank"]]
+    for i, n in enumerate(node_datas):
+        entites_section_list.append(
+            [
+                i,
+                n["entity_name"],
+                n.get("entity_type", "UNKNOWN"),
+                n.get("description", "UNKNOWN"),
+                n["rank"],
+            ]
+        )
+    entities_context = list_of_list_to_csv(entites_section_list)
+
+    relations_section_list=[["id","context"]]
+    for i,e in enumerate(use_relations):
+        relations_section_list.append([i,e])
+    relations_context=list_of_list_to_csv(relations_section_list)
+
+    text_units_section_list = [["id", "content"]]
+    for i, t in enumerate(use_text_units):
+        text_units_section_list.append([i, t["content"]])
+    text_units_context = list_of_list_to_csv(text_units_section_list)
     
+    return entities_context,relations_context,text_units_context
+
+#---------------    
 
     if query_param.only_need_context:
         return context
