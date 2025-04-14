@@ -1469,8 +1469,7 @@ async def _build_query_context(
 -----low-level relationship information-----
 ```csv
 {ll_relations_context}
-```
-"""
+```"""
 
 async def _get_node_data(
     query,
