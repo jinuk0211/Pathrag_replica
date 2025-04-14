@@ -1448,28 +1448,28 @@ async def _build_query_context(
 
 
     return f"""
------global-information-----
------high-level entity information-----
-```csv
+#-----global-information-----
+#-----high-level entity information-----
+#```csv
 {hl_entities_context}
-```
------high-level relationship information-----
-```csv
+#```
+#-----high-level relationship information-----
+#```csv
 {hl_relations_context}
-```
------Sources-----
-```csv
+#```
+#-----Sources-----
+#```csv
 {text_units_context}
-```
------local-information-----
------low-level entity information-----
-```csv
+#```
+#-----local-information-----
+#-----low-level entity information-----
+#```csv
 {ll_entities_context}
-```
------low-level relationship information-----
-```csv
+#```
+#-----low-level relationship information-----
+#```csv
 {ll_relations_context}
-```"""
+#```"""
 
 async def _get_node_data(
     query,
